@@ -1,12 +1,5 @@
 """HTTP application factory and test-client wiring.
 
-Issue #2 specifies two things the factory must do:
-
-1. Run the schema migration **at startup**, not per-request — so the wired-up
-   in-memory database is ready before the first request lands.
-2. Expose a `make_client(db)` seam so tests can inject their own connection
-   and stand on this fixture for every later ticket.
-
 Production path: `create_app()` opens one in-memory SQLite connection during
 the FastAPI lifespan and shares it across every request. Writes survive within
 the process lifetime; persistence across restarts is left to a later ticket.
@@ -14,6 +7,13 @@ the process lifetime; persistence across restarts is left to a later ticket.
 Test path: `create_app(db_factory=...)` short-circuits the lifespan. The
 factory is called per request, so tests can share a single connection
 (`make_client(db)`) across the whole test.
+
+Routes owned by this ticket (issue #3):
+  * `POST /todos`              — create a todo as the authenticated caller.
+  * `GET  /todos/{id}`         — creator-only read; full subscription gate
+                                 lands in issue #4.
+  * `GET  /todos`              — tracer-bullet route; subscription list lands
+                                 in #8.
 """
 
 from __future__ import annotations
@@ -22,13 +22,32 @@ import sqlite3
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 
 from .auth import AuthUser, verify_jwt
 from .db import make_db
+from .domain import CreateTodoInput, InvalidTitleError, Todo, TodoService
+from .repository import TodoRepository
 
 DBFactory = Callable[[], sqlite3.Connection]
+
+
+class CreateTodoBody(BaseModel):
+    """`POST /todos` request body.
+
+    Shape validation only: `title` must be a string, `description` optional.
+    The non-blank rule for `title` lives in `TodoService` (the domain), so
+    it is enforced through a single path and translates to a single 422
+    response in the route.
+
+    Defined at module scope so Pydantic can resolve the forward reference
+    that FastAPI builds for body parameters.
+    """
+
+    title: str
+    description: str | None = None
 
 
 def create_app(db_factory: DBFactory | None = None) -> FastAPI:
@@ -54,12 +73,58 @@ def create_app(db_factory: DBFactory | None = None) -> FastAPI:
             return db_factory()
         return request.app.state.db
 
+    def get_service(db: sqlite3.Connection = Depends(get_db)) -> TodoService:
+        # `TodoService` is stateless w.r.t. connections; the per-request `db`
+        # flows through to the repository on each call.
+        return TodoService(TodoRepository())
+
+    # --- routes -----------------------------------------------------------
+
     @app.get("/todos")
     def list_todos(user: AuthUser = Depends(verify_jwt)) -> dict[str, list[dict[str, object]]]:
-        # Tracer bullet: return an empty list. The subscription model and
-        # `get_db` wiring are filled in by the next ticket.
+        # Tracer bullet: subscription model lands in #8.
         _ = user
         return {"todos": []}
+
+    @app.post("/todos", status_code=status.HTTP_201_CREATED)
+    def create_todo(
+        body: CreateTodoBody = Body(...),
+        user: AuthUser = Depends(verify_jwt),
+        db: sqlite3.Connection = Depends(get_db),
+        service: TodoService = Depends(get_service),
+    ) -> dict[str, object]:
+        try:
+            todo = service.create(
+                db,
+                created_by=user.sub,
+                input=CreateTodoInput(
+                    title=body.title,
+                    description=body.description or "",
+                ),
+            )
+        except InvalidTitleError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="title must be a non-empty string",
+            ) from None
+        return _serialize_todo(todo)
+
+    @app.get("/todos/{todo_id}")
+    def get_todo(
+        todo_id: int,
+        user: AuthUser = Depends(verify_jwt),
+        db: sqlite3.Connection = Depends(get_db),
+        service: TodoService = Depends(get_service),
+    ) -> dict[str, object]:
+        # Creator bypass: the creator can always read their own todos. The
+        # subscription gate (`404` for non-subscribers) is issue #4.
+        todo = service.get(db, todo_id)
+        if todo is None or todo.created_by != user.sub:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="todo not found",
+            )
+        return _serialize_todo(todo)
 
     return app
 
@@ -67,3 +132,24 @@ def create_app(db_factory: DBFactory | None = None) -> FastAPI:
 def make_client(db: sqlite3.Connection) -> TestClient:
     """Build a TestClient sharing `db` across every request."""
     return TestClient(create_app(db_factory=lambda: db))
+
+
+def _serialize_todo(todo: Todo) -> dict[str, object]:
+    """Project a `domain.Todo` onto the API response shape.
+
+    Kept module-private — the response shape is an HTTP concern, not a
+    domain concern. Pydantic models could do this work, but a plain dict
+    keeps the diff tight and matches the tracer bullet's existing style.
+    """
+    return {
+        "id": todo.id,
+        "title": todo.title,
+        "description": todo.description,
+        "state": todo.state.value,
+        "created_by": todo.created_by,
+        "created_at": todo.created_at,
+        "updated_at": todo.updated_at,
+        "completed_at": todo.completed_at,
+        "deleted_at": todo.deleted_at,
+        "blocked_reason": todo.blocked_reason,
+    }
