@@ -5,3 +5,13 @@ node_modules/
 
 # Local scratch space
 .scratch/
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.python-version

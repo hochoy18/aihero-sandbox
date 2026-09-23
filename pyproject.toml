@@ -1,0 +1,20 @@
+[project]
+name = "aihero-sandbox"
+version = "0.1.0"
+description = "Add your description here"
+authors = [
+    { name = "cai_he", email = "cai.hochoy@gmail.com" }
+]
+requires-python = ">=3.11,<3.12"
+dependencies = []
+
+[project.scripts]
+aihero-sandbox = "todos:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "todos"
+module-root = "src/apps"
