@@ -538,7 +538,6 @@ class TodoService:
 __all__ = [
     "AlreadySubscribedError",
     "CreateTodoInput",
-    "DEFAULT_ACTIVE_STATES",
     "InvalidStateTransitionError",
     "InvalidTitleError",
     "NotCreatorError",

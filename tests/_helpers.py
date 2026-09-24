@@ -5,9 +5,11 @@ because the seam felt small enough that a copy-paste was cheaper than
 a shared import. By issue #7 three files had grown near-identical
 copies, so they now live here once and the test files import them.
 
-The same threshold was crossed for `_insert_subscription` by issue #8
-(three test files pinned a `user_todo_views` row directly), so it
-joins the helpers here.
+`_insert_subscription` lands here by issue #8: the two existing files
+that pinned a `user_todo_views` row inline (`test_get_todo_by_id.py`,
+`test_patch_todo.py`) and the new `test_list_todos.py` all need a
+deterministic per-user `position`, and the subscribe endpoint's
+`max + 1` rule is exactly what those tests want to bypass.
 
 `test_post_todos.py` keeps its own `_create` because the body shape
 differs (it sends arbitrary JSON, not just a title).
