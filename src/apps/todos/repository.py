@@ -239,8 +239,10 @@ class UserTodoViewRepository:
     not here — this repository answers only "does this user have a view of
     this todo?"
 
-    Subscribe, unsubscribe, list-by-user, and reorder methods (issue #9)
-    will land here in a follow-up ticket.
+    Issue #7 adds subscribe / unsubscribe / list-by-user. The repository
+    is still storage-only — domain rules (e.g. "you can't subscribe twice
+    to the same todo", "subscribe uses max(position) + 1") live in
+    `TodoService` so the HTTP layer stays free of business logic.
     """
 
     def has_view(
@@ -256,6 +258,90 @@ class UserTodoViewRepository:
             (user_id, todo_id),
         ).fetchone()
         return row is not None
+
+    def max_position(
+        self, conn: sqlite3.Connection, *, user_id: str
+    ) -> int:
+        """Return the highest `position` `user_id` currently holds, or 0.
+
+        Used by the service to pick the next subscription position
+        (`max + 1`). Returns `0` for a user with no subscriptions, so
+        the caller's arithmetic lands at `1` for the first row.
+        `SQLite`'s `MAX` over zero rows is `NULL`; the explicit
+        `COALESCE` keeps that boundary explicit at this seam.
+        """
+        row = conn.execute(
+            "SELECT COALESCE(MAX(position), 0) AS max_position "
+            "FROM user_todo_views WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return int(row["max_position"])
+
+    def subscribe(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        user_id: str,
+        todo_id: int,
+        position: int,
+        subscribed_at: str,
+    ) -> None:
+        """Insert a single `user_todo_views` row.
+
+        Caller is responsible for choosing `position` (the service
+        computes `max(user.position) + 1`). The caller must also ensure
+        the row doesn't already exist — the unique `(user_id, todo_id)`
+        primary key means a duplicate `INSERT` raises `sqlite3.IntegrityError`,
+        which the domain layer translates into `AlreadySubscribedError`.
+        """
+        conn.execute(
+            "INSERT INTO user_todo_views "
+            "(user_id, todo_id, position, subscribed_at) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, todo_id, position, subscribed_at),
+        )
+        conn.commit()
+
+    def unsubscribe(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        user_id: str,
+        todo_id: int,
+    ) -> bool:
+        """Delete the `(user_id, todo_id)` row; return whether one was deleted.
+
+        Idempotent at the SQL layer: a `DELETE` that matches no rows
+        just leaves zero rows affected. The boolean return lets the
+        service stay HTTP-agnostic — `True` / `False` here is a
+        mechanical signal, not a status code.
+        """
+        cursor = conn.execute(
+            "DELETE FROM user_todo_views "
+            "WHERE user_id = ? AND todo_id = ?",
+            (user_id, todo_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+    def list_todo_ids_for_user(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        user_id: str,
+    ) -> list[int]:
+        """Return every `todo_id` `user_id` is subscribed to, by `position` ASC.
+
+        Ordered by the user's per-row `position` so the service can hand
+        the resulting `Todo` list straight to the API. Filtering by
+        `state` lands in #8 (the `?state=...` query param).
+        """
+        rows = conn.execute(
+            "SELECT todo_id FROM user_todo_views "
+            "WHERE user_id = ? ORDER BY position ASC",
+            (user_id,),
+        ).fetchall()
+        return [int(row["todo_id"]) for row in rows]
 
 
 __all__ = [

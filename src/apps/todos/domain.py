@@ -23,6 +23,11 @@ that with an SQL `WHERE updated_at = ?` clause. A precondition failure
 becomes `StalePreconditionError` here, which the HTTP layer maps to
 `409 Conflict`. The same seam will be reused by the DELETE path (T7).
 
+Issue #7 adds `subscribe` / `unsubscribe` / `list_for_user`: subscribe
+assigns `position = max(user.position) + 1`, refuses to double-subscribe,
+and lists the user's view in `position` order. The HTTP layer still owns
+the read gate (404 vs 200).
+
 The domain depends only on the persistence layer (no FastAPI, no HTTP
 status codes). The HTTP layer maps domain errors into status codes.
 """
@@ -130,6 +135,30 @@ class StalePreconditionError(Exception):
     The error is raised by `TodoService.update` only — the repository
     signals the same condition by returning `None`, and the service is
     the layer that turns a SQL rowcount of zero into a domain concept.
+    """
+
+
+class TodoNotFoundError(Exception):
+    """Raised when a Todo referenced by id doesn't exist.
+
+    Distinct from "exists but no access" — the read gate (`get_for_user`)
+    conflates those into a single `None` return for `GET /todos/{id}`,
+    but `subscribe` needs to tell them apart. A subscription to a
+    missing todo is a `404`; subscribing without access is fine
+    (anyone authenticated can subscribe to anything), so that case
+    doesn't exist. The HTTP layer maps this to `404 Not Found`.
+    """
+
+
+class AlreadySubscribedError(Exception):
+    """Raised when a user tries to subscribe to a todo they're already on.
+
+    The `(user_id, todo_id)` primary key on `user_todo_views` would
+    raise `sqlite3.IntegrityError` on a duplicate insert; the service
+    pre-checks via `has_view` to translate that into a domain concept.
+    The HTTP layer maps this to `422 Unprocessable Entity` — the
+    request is well-formed but semantically wrong (you can't join
+    twice).
     """
 
 
@@ -380,14 +409,118 @@ class TodoService:
             )
         return Todo.from_row(updated)
 
+    def subscribe(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        user_id: str,
+        todo_id: int,
+    ) -> None:
+        """Subscribe `user_id` to `todo_id` at `max(user.position) + 1`.
+
+        Raises:
+          * `TodoNotFoundError` — no row with that id.
+          * `AlreadySubscribedError` — `user_id` already has a view row
+            for this todo. The unique `(user_id, todo_id)` primary key
+            would also catch this at SQL level; we pre-check so the
+            HTTP layer sees a domain concept (`422`) instead of an
+            `sqlite3.IntegrityError`, AND catch `IntegrityError` as a
+            belt-and-suspenders fallback for the race window between
+            the pre-check and the insert (two concurrent subscribes
+            from the same user would both pass `has_view` and then
+            collide at the unique PK).
+
+        Position rule: `max(user_id's existing positions) + 1`, with
+        `max over zero rows = 0` so the first subscription lands at
+        `1`. The rule is per-user, not global — Alice's high position
+        does not bump Bob's first subscription.
+
+        Concurrency note: two simultaneous subscribes for *different*
+        `todo_id`s can both read `max = N` and both write `N + 1`,
+        producing duplicate positions. The position column is not
+        unique by spec — it only orders the view — so this is benign
+        (ties are resolved arbitrarily) and a transactional SELECT
+        MAX + INSERT is left for a future optimisation.
+        """
+        if self._todos.get_by_id(conn, todo_id) is None:
+            raise TodoNotFoundError(
+                f"todo {todo_id} does not exist"
+            )
+        if self._views.has_view(conn, user_id=user_id, todo_id=todo_id):
+            raise AlreadySubscribedError(
+                f"user {user_id} is already subscribed to todo {todo_id}"
+            )
+        next_position = self._views.max_position(conn, user_id=user_id) + 1
+        try:
+            self._views.subscribe(
+                conn,
+                user_id=user_id,
+                todo_id=todo_id,
+                position=next_position,
+                subscribed_at=utcnow_iso(),
+            )
+        except sqlite3.IntegrityError as exc:
+            # Two concurrent subscribes from the same user to the same
+            # todo both passed `has_view` and one lost the race to the
+            # unique `(user_id, todo_id)` PK. Translate the SQL failure
+            # into the same domain error the pre-check would have
+            # raised, so the HTTP layer can shape the 422 the same way.
+            raise AlreadySubscribedError(
+                f"user {user_id} is already subscribed to todo {todo_id}"
+            ) from exc
+
+    def unsubscribe(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        user_id: str,
+        todo_id: int,
+    ) -> None:
+        """Remove `user_id`'s view row for `todo_id` if it exists.
+
+        Idempotent at this layer: calling unsubscribe on a user who
+        isn't subscribed (or on a non-existent todo) is a no-op. The
+        repository's `unsubscribe` returns a bool the service discards;
+        the HTTP layer translates "idempotent" into `204` regardless.
+        """
+        self._views.unsubscribe(conn, user_id=user_id, todo_id=todo_id)
+
+    def list_for_user(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        user_id: str,
+    ) -> list[Todo]:
+        """Return the `Todo`s `user_id` is subscribed to, by position ASC.
+
+        Joins in Python: the views table holds ids, the todos table
+        holds the rows, so the service glues them. The N+1 here is
+        acceptable for MVP — the per-user list is bounded by what one
+        person has chosen to track, and a single `IN (...)` fetch is
+        an easy follow-up if profiles get large.
+
+        Filtering by `state` (the `?state=...` query param) lands in
+        #8; this method returns *all* subscribed rows in position
+        order, the default-active filter is layered on top later.
+        """
+        todo_ids = self._views.list_todo_ids_for_user(conn, user_id=user_id)
+        todos: list[Todo] = []
+        for todo_id in todo_ids:
+            row = self._todos.get_by_id(conn, todo_id)
+            if row is not None:
+                todos.append(Todo.from_row(row))
+        return todos
+
 
 __all__ = [
+    "AlreadySubscribedError",
     "CreateTodoInput",
     "InvalidStateTransitionError",
     "InvalidTitleError",
     "NotCreatorError",
     "StalePreconditionError",
     "Todo",
+    "TodoNotFoundError",
     "TodoService",
     "TodoState",
     "UNSET",

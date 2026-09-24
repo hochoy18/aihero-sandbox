@@ -30,8 +30,17 @@ Routes owned by issue #6:
                                  path can attach the same dependency
                                  without duplicating the header check.
 
+Routes owned by issue #7:
+  * `POST   /todos/{id}/subscribe` — add a `user_todo_views` row at
+                                     `max(user.position) + 1`.
+  * `DELETE /todos/{id}/subscribe` — remove the row; idempotent.
+  * `GET    /todos`                — list the caller's subscribed todos
+                                     in `position` order. State filtering
+                                     and the default-active behaviour
+                                     land in #8.
+
 Tracers left by issue #2:
-  * `GET  /todos`              — empty list; subscription list lands in #8.
+  * (none — the tracer list endpoint grew up into the real one in #7)
 """
 
 from __future__ import annotations
@@ -40,19 +49,21 @@ import sqlite3
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
 from .auth import AuthUser, verify_jwt
 from .db import make_db
 from .domain import (
+    AlreadySubscribedError,
     CreateTodoInput,
     InvalidStateTransitionError,
     InvalidTitleError,
     NotCreatorError,
     StalePreconditionError,
     Todo,
+    TodoNotFoundError,
     TodoService,
     TodoState,
     UpdateTodoInput,
@@ -186,10 +197,16 @@ def create_app(db_factory: DBFactory | None = None) -> FastAPI:
     # --- routes -----------------------------------------------------------
 
     @app.get("/todos")
-    def list_todos(user: AuthUser = Depends(verify_jwt)) -> dict[str, list[dict[str, object]]]:
-        # Tracer bullet: subscription model lands in #8.
-        _ = user
-        return {"todos": []}
+    def list_todos(
+        user: AuthUser = Depends(verify_jwt),
+        db: sqlite3.Connection = Depends(get_db),
+        service: TodoService = Depends(get_service),
+    ) -> dict[str, list[dict[str, object]]]:
+        # Issue #7: return the caller's subscribed todos in their own
+        # `position` order. State filtering and the active-only default
+        # land in #8; this returns everything they're subscribed to.
+        todos = service.list_for_user(db, user_id=user.sub)
+        return {"todos": [_serialize_todo(t) for t in todos]}
 
     @app.post("/todos", status_code=status.HTTP_201_CREATED)
     def create_todo(
@@ -283,6 +300,55 @@ def create_app(db_factory: DBFactory | None = None) -> FastAPI:
             ) from None
 
         return _serialize_todo(todo)
+
+    @app.post(
+        "/todos/{todo_id}/subscribe",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def subscribe_to_todo(
+        todo_id: int,
+        user: AuthUser = Depends(verify_jwt),
+        db: sqlite3.Connection = Depends(get_db),
+        service: TodoService = Depends(get_service),
+    ) -> dict[str, object]:
+        # `subscribe` is a public-to-authenticated-users operation: any
+        # caller may join any existing todo. There's no per-todo ACL.
+        # The service handles the not-found check and the duplicate-row
+        # check; we just map the domain errors to status codes.
+        try:
+            service.subscribe(db, user_id=user.sub, todo_id=todo_id)
+        except TodoNotFoundError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="todo not found",
+            ) from None
+        except AlreadySubscribedError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="already subscribed",
+            ) from None
+        # Return just the `todo_id` — the caller already knows what
+        # they subscribed to. A future ticker could surface the
+        # assigned `position` so the client can build a reorder call
+        # without re-reading; for now `GET /todos` is the source of
+        # truth for that.
+        return {"todo_id": todo_id}
+
+    @app.delete("/todos/{todo_id}/subscribe")
+    def unsubscribe_from_todo(
+        todo_id: int,
+        user: AuthUser = Depends(verify_jwt),
+        db: sqlite3.Connection = Depends(get_db),
+        service: TodoService = Depends(get_service),
+    ) -> Response:
+        # Idempotent by design: unsubscribing from a todo you never
+        # joined (or that doesn't exist) is a `204`, not a `404`. The
+        # resource is in the desired state after the call, and
+        # forcing the client to check first is busywork. The domain
+        # layer implements this; the HTTP layer just sets the status
+        # code and returns an empty body.
+        service.unsubscribe(db, user_id=user.sub, todo_id=todo_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     return app
 

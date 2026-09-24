@@ -17,20 +17,7 @@ from fastapi.testclient import TestClient
 
 from todos.auth import make_jwt
 
-
-def _create(client: TestClient, sub: str, title: str = "x") -> int:
-    token = make_jwt(sub=sub)
-    response = client.post(
-        "/todos",
-        json={"title": title},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert response.status_code == 201
-    return response.json()["id"]
-
-
-def _auth(sub: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {make_jwt(sub=sub)}"}
+from ._helpers import _auth, _create
 
 
 def _insert_subscription(
