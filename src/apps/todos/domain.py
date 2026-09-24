@@ -17,6 +17,12 @@ Issue #5 adds `update()`: the state machine (ADR-0001) plus creator-only
 soft-delete. The HTTP layer is responsible for `If-Match`; the domain is
 responsible for transitions, creator-only rules, and title validation.
 
+Issue #6 threads optimistic concurrency through `update()`: every write
+must carry the `updated_at` the caller read, and the repository enforces
+that with an SQL `WHERE updated_at = ?` clause. A precondition failure
+becomes `StalePreconditionError` here, which the HTTP layer maps to
+`409 Conflict`. The same seam will be reused by the DELETE path (T7).
+
 The domain depends only on the persistence layer (no FastAPI, no HTTP
 status codes). The HTTP layer maps domain errors into status codes.
 """
@@ -112,6 +118,19 @@ class InvalidStateTransitionError(Exception):
 
 class NotCreatorError(Exception):
     """Raised when a non-creator attempts a creator-only operation (delete)."""
+
+
+class StalePreconditionError(Exception):
+    """Raised when the caller's `If-Match` value no longer matches the row.
+
+    Indicates optimistic-concurrency loss: the `updated_at` the caller
+    read has been overwritten by another writer between the read and
+    this write. The HTTP layer translates this to `409 Conflict`.
+
+    The error is raised by `TodoService.update` only — the repository
+    signals the same condition by returning `None`, and the service is
+    the layer that turns a SQL rowcount of zero into a domain concept.
+    """
 
 
 # `UNSET` is the canonical sentinel for "field was not included in the
@@ -259,6 +278,7 @@ class TodoService:
         *,
         todo_id: int,
         actor_id: str,
+        expected_updated_at: str,
         input: UpdateTodoInput,
     ) -> Todo:
         """Apply `input` to the row, enforcing the state machine and
@@ -270,20 +290,25 @@ class TodoService:
             is not in the state machine (ADR-0001).
           * `NotCreatorError` — the caller is not the creator but is trying
             to transition to `deleted`.
+          * `StalePreconditionError` — `expected_updated_at` does not match
+            the row's current `updated_at`. The HTTP layer maps this to
+            `409 Conflict`; the client must re-read and retry.
 
         Subscription gating (404) is the HTTP layer's job; this method
-        trusts the caller has access. `If-Match` precondition checks are
-        also the HTTP layer's job (issue #5 accepts any value, T3b / #6
-        will compare to `updated_at`).
+        trusts the caller has access. The `expected_updated_at` value is
+        the verbatim `If-Match` header the client sent — the repository's
+        SQL is what actually enforces the comparison, so this method
+        doesn't peek at the row before the write.
         """
-        row = self._todos.get_by_id(conn, todo_id)
-        todo = Todo.from_row(row)
-
         # Resolve the requested state (if any) and validate the transition
         # before touching any field — fail closed. We compute the eventual
         # `state` column write and the side-effect timestamps
         # (`completed_at`, `deleted_at`) up front so the repository call
-        # below stays a single SQL statement.
+        # below stays a single SQL statement. The row's current state
+        # comes from a single read inside the same `conn` so SQLite sees
+        # the transaction begin here.
+        row = self._todos.get_by_id(conn, todo_id)
+        todo = Todo.from_row(row)
         new_state: TodoState | None = None
         new_completed_at: Any = UNSET
         new_deleted_at: Any = UNSET
@@ -336,6 +361,7 @@ class TodoService:
         updated = self._todos.update(
             conn,
             todo_id=todo_id,
+            expected_updated_at=expected_updated_at,
             title=new_title,
             description=new_description,
             state=new_state.value if new_state is not None else UNSET,
@@ -343,6 +369,15 @@ class TodoService:
             completed_at=new_completed_at,
             deleted_at=new_deleted_at,
         )
+        if updated is None:
+            # The atomic SQL UPDATE matched zero rows: either the row was
+            # removed (not possible today) or — the only path that can
+            # fire here — `expected_updated_at` no longer matches the
+            # row. Surface that as a domain concept so the HTTP layer
+            # can shape the 409 response.
+            raise StalePreconditionError(
+                "If-Match value does not match the row's updated_at"
+            )
         return Todo.from_row(updated)
 
 
@@ -351,6 +386,7 @@ __all__ = [
     "InvalidStateTransitionError",
     "InvalidTitleError",
     "NotCreatorError",
+    "StalePreconditionError",
     "Todo",
     "TodoService",
     "TodoState",

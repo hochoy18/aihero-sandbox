@@ -65,12 +65,46 @@ def _patch(
     todo_id: int,
     sub: str,
     body: dict[str, Any],
-    if_match: str | None = "anything",
+    if_match: str | None = "auto",
 ) -> Any:
+    """Send a PATCH, with the If-Match value resolved for the caller.
+
+    By default the helper fetches the row's current `updated_at` and
+    sends it as the `If-Match` header, so most tests can stay focused on
+    the behavior they actually exercise (state machine, blocked_reason,
+    access checks) instead of threading timestamps through every call.
+    Pass an explicit `if_match=<value>` to send a specific header (used
+    by the T3b tests for stale / fresh / matching values); pass
+    `if_match=None` to omit the header entirely (used by
+    `test_patch_without_if_match_returns_409`).
+
+    The auto-fetch silently no-ops when the row is not visible to `sub`
+    (a `GET` returns `404` because the row doesn't exist or the caller
+    isn't subscribed). In that case the PATCH carries no `If-Match`
+    header, so the subscription gate fires first and returns the same
+    `404` envelope — preserving the behavior the access-check tests
+    assert against.
+    """
     headers = _auth(sub)
+    if if_match == "auto":
+        current = client.get(f"/todos/{todo_id}", headers=headers)
+        if current.status_code == 200:
+            if_match = current.json()["updated_at"]
+        else:
+            # Row isn't visible to this caller; skip the auto-fetch and
+            # let the PATCH surface its own 404 from the subscription
+            # gate. Sending a stale placeholder would 409 before the
+            # gate, hiding the 404 the test is asserting.
+            if_match = None
     if if_match is not None:
         headers["If-Match"] = if_match
     return client.patch(f"/todos/{todo_id}", json=body, headers=headers)
+
+
+def _get_todo(client: TestClient, todo_id: int, sub: str) -> dict[str, Any]:
+    response = client.get(f"/todos/{todo_id}", headers=_auth(sub))
+    assert response.status_code == 200
+    return response.json()
 
 
 # --- legal state transitions -----------------------------------------------
@@ -312,25 +346,6 @@ def test_patch_without_if_match_returns_409(client: TestClient) -> None:
     assert response.status_code == 409
 
 
-def test_patch_if_match_value_is_accepted_regardless(client: TestClient) -> None:
-    """AC: any non-empty `If-Match` value is accepted in this ticket.
-
-    Validation of the header against the row's `updated_at` lands in T3b (#6).
-    """
-    todo_id = _create(client, "alice")
-
-    response = _patch(
-        client,
-        todo_id=todo_id,
-        sub="alice",
-        body={"title": "y"},
-        if_match="totally-wrong-value",
-    )
-
-    assert response.status_code == 200
-    assert response.json()["title"] == "y"
-
-
 def test_patch_refreshes_updated_at(client: TestClient) -> None:
     """AC: server refreshes `updated_at` on success."""
     todo_id = _create(client, "alice")
@@ -346,10 +361,213 @@ def test_patch_refreshes_updated_at(client: TestClient) -> None:
     assert new_updated_at != initial_updated_at
 
 
-def _get_todo(client: TestClient, todo_id: int, sub: str) -> dict[str, Any]:
-    response = client.get(f"/todos/{todo_id}", headers=_auth(sub))
+# --- If-Match value vs updated_at (T3b / #6) -------------------------------
+#
+# Optimistic concurrency: only the request carrying the latest `updated_at`
+# in `If-Match` may mutate the row. Every other value -- including the
+# *previous* `updated_at` from before a successful PATCH -- is rejected
+# with `409 Conflict`. The atomic compare-and-swap is enforced at SQL
+# level (`WHERE id = ? AND updated_at = ?`), so two writers that race
+# with the same stale value get exactly one `200` and one `409`.
+
+
+def test_patch_fresh_if_match_returns_200(client: TestClient) -> None:
+    """AC: PATCH using `If-Match: "<updated_at_v1>"` -> 200.
+
+    Captures the row's `updated_at_v1`, sends it back as `If-Match`, and
+    expects the write to succeed. This is the baseline the other AC tests
+    compare against.
+    """
+    todo_id = _create(client, "alice")
+    updated_at_v1 = _get_todo(client, todo_id, "alice")["updated_at"]
+
+    response = _patch(
+        client,
+        todo_id=todo_id,
+        sub="alice",
+        body={"title": "y"},
+        if_match=updated_at_v1,
+    )
+
     assert response.status_code == 200
-    return response.json()
+    assert response.json()["title"] == "y"
+
+
+def test_patch_stale_if_match_returns_409(client: TestClient) -> None:
+    """AC: PATCH using a stale `If-Match` value -> 409.
+
+    After a successful PATCH, the row's `updated_at` is refreshed. A second
+    PATCH carrying the *previous* value must be rejected; the client is
+    working from a stale read and shouldn't be allowed to silently overwrite.
+    """
+    todo_id = _create(client, "alice")
+    updated_at_v1 = _get_todo(client, todo_id, "alice")["updated_at"]
+
+    # Server timestamps are second-precision; sleep so the next write
+    # lands on a fresh second and `updated_at` actually moves.
+    time.sleep(1.05)
+
+    # First write succeeds and refreshes `updated_at` -> v2.
+    first = _patch(client, todo_id=todo_id, sub="alice", body={"title": "y"})
+    assert first.status_code == 200
+    updated_at_v2 = first.json()["updated_at"]
+    assert updated_at_v2 != updated_at_v1
+
+    # Second write with the *original* v1 header is now stale.
+    response = _patch(
+        client,
+        todo_id=todo_id,
+        sub="alice",
+        body={"title": "z"},
+        if_match=updated_at_v1,
+    )
+
+    assert response.status_code == 409
+
+
+def test_patch_after_success_new_if_match_returns_200(client: TestClient) -> None:
+    """AC: PATCH using the freshly-refreshed `If-Match` -> 200.
+
+    The client reads `updated_at_v2` from the first successful response,
+    then sends it back. The row is in sync; the write succeeds.
+    """
+    todo_id = _create(client, "alice")
+    updated_at_v1 = _get_todo(client, todo_id, "alice")["updated_at"]
+
+    time.sleep(1.05)  # ensure the first write lands on a fresh second
+
+    first = _patch(client, todo_id=todo_id, sub="alice", body={"title": "y"})
+    assert first.status_code == 200
+    updated_at_v2 = first.json()["updated_at"]
+
+    response = _patch(
+        client,
+        todo_id=todo_id,
+        sub="alice",
+        body={"title": "z"},
+        if_match=updated_at_v2,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["title"] == "z"
+    # The first read was an honest stale snapshot; the assertion above is
+    # not just an artifact of timestamps ticking over.
+    assert updated_at_v2 != updated_at_v1
+
+
+def test_patch_refreshes_updated_at_visible_on_reread(client: TestClient) -> None:
+    """AC: re-read after a successful PATCH shows a new `updated_at`.
+
+    Captures `updated_at_v1` from a `GET`, sends a PATCH (carrying v1 as
+    `If-Match`), then re-reads and asserts the timestamp differs. This is
+    the same guarantee `test_patch_refreshes_updated_at` covers, framed
+    through the If-Match flow that #6 makes load-bearing.
+    """
+    todo_id = _create(client, "alice")
+    updated_at_v1 = _get_todo(client, todo_id, "alice")["updated_at"]
+
+    time.sleep(1.05)  # server timestamps are second-precision
+
+    patch_response = _patch(
+        client,
+        todo_id=todo_id,
+        sub="alice",
+        body={"title": "y"},
+        if_match=updated_at_v1,
+    )
+    assert patch_response.status_code == 200
+    updated_at_v2 = patch_response.json()["updated_at"]
+
+    reread = _get_todo(client, todo_id, "alice")
+    assert reread["updated_at"] == updated_at_v2
+    assert reread["updated_at"] != updated_at_v1
+
+
+def test_patch_two_concurrent_writes_one_200_one_409(
+    client: TestClient,
+) -> None:
+    """AC: two PATCHes with the same `If-Match` -> exactly one `200`, one `409`.
+
+    The SQL-level compare-and-swap (`WHERE id = ? AND updated_at = ?`) is
+    what makes this guarantee hold even under true concurrency: the first
+    writer to land flips `updated_at`, and the second writer's `UPDATE`
+    matches zero rows. SQLite serialises writes inside a single
+    connection, so a sequential replay is faithful to the production
+    contract here.
+    """
+    todo_id = _create(client, "alice")
+    updated_at_v1 = _get_todo(client, todo_id, "alice")["updated_at"]
+
+    time.sleep(1.05)  # server timestamps are second-precision
+
+    first = _patch(
+        client,
+        todo_id=todo_id,
+        sub="alice",
+        body={"title": "first"},
+        if_match=updated_at_v1,
+    )
+    second = _patch(
+        client,
+        todo_id=todo_id,
+        sub="alice",
+        body={"title": "second"},
+        if_match=updated_at_v1,
+    )
+
+    statuses = sorted([first.status_code, second.status_code])
+    assert statuses == [200, 409]
+
+    # The successful write landed; the row carries "first" (the first
+    # writer wins because the second writer's UPDATE matched zero rows).
+    final = _get_todo(client, todo_id, "alice")
+    assert final["title"] == "first"
+
+
+def test_patch_arbitrary_if_match_value_returns_409(client: TestClient) -> None:
+    """A random non-empty `If-Match` value is not a valid `updated_at`.
+
+    The T3a ticket (#5) accepted any value as a stand-in; #6 closes that
+    loophole. A client sending `If-Match: "anything"` against a real row
+    is now a `409`, not a `200`.
+    """
+    todo_id = _create(client, "alice")
+
+    response = _patch(
+        client,
+        todo_id=todo_id,
+        sub="alice",
+        body={"title": "y"},
+        if_match="totally-wrong-value",
+    )
+
+    assert response.status_code == 409
+
+
+def test_patch_if_match_precondition_is_independent_of_subscription_gate(
+    client: TestClient, db: sqlite3.Connection
+) -> None:
+    """The `If-Match` check fires after the subscription gate, not before.
+
+    A non-subscriber still gets `404` (the gate hides the row first);
+    an If-Match that doesn't match the row would have returned `409`,
+    but the gate short-circuits before we ever compare. This guards
+    against a regression where If-Match validation runs first and
+    accidentally confirms the row exists to a non-subscriber.
+    """
+    todo_id = _create(client, "alice")
+    updated_at_v1 = _get_todo(client, todo_id, "alice")["updated_at"]
+    # bob has no subscription row, so the gate hides the todo.
+
+    response = _patch(
+        client,
+        todo_id=todo_id,
+        sub="bob",
+        body={"title": "y"},
+        if_match=updated_at_v1,
+    )
+
+    assert response.status_code == 404
 
 
 # --- invalid body shape ---------------------------------------------------

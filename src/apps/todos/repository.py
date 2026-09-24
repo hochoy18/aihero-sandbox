@@ -16,6 +16,13 @@ repository stamps `updated_at` itself; the service layer also sets
 `completed_at` / `deleted_at` via the same `update()` call when the new
 state implies those timestamps, so callers see exactly one write per
 PATCH.
+
+Issue #6 threads optimistic concurrency through `update()`: every write
+must carry the `updated_at` the client read, and the SQL `UPDATE` is
+guarded by `WHERE id = ? AND updated_at = ?`. A `rowcount` of zero means
+the precondition failed (the row was changed by another writer between
+the client's read and this write); the repository returns `None` and the
+service translates that into a domain error.
 """
 
 from __future__ import annotations
@@ -35,13 +42,18 @@ def utcnow_iso() -> str:
     """Server-set timestamp in ISO 8601 with a trailing Z.
 
     Clients cannot override timestamps — this is the single source of `now()`.
-    Microseconds are dropped to match the tracer-bullet fixture format and
-    keep responses diff-friendly in tests.
+
+    Microsecond precision matters for optimistic concurrency (#6):
+    `updated_at` is the compare-and-swap token, and two PATCHes that land
+    inside the same second would otherwise collide on the same string
+    and both succeed against `WHERE updated_at = ?`. The tracer bullet
+    used second-precision for diff-friendly test fixtures; #6 promotes
+    this to microseconds so the CAS is unique at sub-second scale.
 
     Public so the domain layer can stamp `completed_at` and `deleted_at`
     when transitioning to terminal states without going through SQL.
     """
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 # Sentinel mirroring the domain layer's `UNSET`. Lives here so the
@@ -116,13 +128,14 @@ class TodoRepository:
         conn: sqlite3.Connection,
         *,
         todo_id: int,
+        expected_updated_at: str,
         title: Any = UNSET,
         description: Any = UNSET,
         state: Any = UNSET,
         blocked_reason: Any = UNSET,
         completed_at: Any = UNSET,
         deleted_at: Any = UNSET,
-    ) -> TodoRow:
+    ) -> TodoRow | None:
         """Apply a partial update and return the persisted row.
 
         Columns whose argument is `UNSET` are not written; everything else
@@ -134,6 +147,18 @@ class TodoRepository:
         `completed_at` and `deleted_at` are stamped by the service layer
         when the new state implies those timestamps, so they share this
         single SQL statement and a single transaction.
+
+        Issue #6 — optimistic concurrency: the SQL `UPDATE` is guarded by
+        `WHERE id = ? AND updated_at = ?`. If the client's `expected_updated_at`
+        no longer matches the row (someone else wrote first), zero rows are
+        affected and the method returns `None`. The caller is responsible
+        for translating `None` into a domain-level precondition failure;
+        the repository stays HTTP-agnostic.
+
+        The check is at SQL level on purpose: a Python-side read-then-write
+        would race with another writer between the read and the write.
+        Wrapping both the precondition and the write in a single SQL
+        statement makes the guarantee atomic.
         """
         assignments: list[str] = []
         params: list[Any] = []
@@ -164,11 +189,18 @@ class TodoRepository:
         params.append(now)
 
         params.append(todo_id)
-        conn.execute(
-            f"UPDATE todos SET {', '.join(assignments)} WHERE id = ?",
+        params.append(expected_updated_at)
+        cursor = conn.execute(
+            f"UPDATE todos SET {', '.join(assignments)} "
+            "WHERE id = ? AND updated_at = ?",
             params,
         )
         conn.commit()
+        # `cursor.rowcount` is the number of rows the UPDATE actually
+        # matched. Zero means the precondition failed (or the row was
+        # removed); both collapse to "precondition not met" at this seam.
+        if cursor.rowcount == 0:
+            return None
         return self._get_by_id(conn, todo_id)
 
     def _get_by_id(self, conn: sqlite3.Connection, todo_id: int) -> TodoRow | None:

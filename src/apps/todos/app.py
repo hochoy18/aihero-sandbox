@@ -19,9 +19,16 @@ Routes owned by issue #4:
 Routes owned by issue #5:
   * `PATCH /todos/{id}`        — state machine + creator-only delete,
                                  freely-writable `blocked_reason`, and a
-                                 required `If-Match` header whose value is
-                                 accepted unchecked for now (T3b / #6 will
-                                 validate it against `updated_at`).
+                                 required `If-Match` header.
+
+Routes owned by issue #6:
+  * `PATCH /todos/{id}`        — `If-Match` value is validated against the
+                                 row's current `updated_at` (T3b).
+  * `require_if_match`         — reusable FastAPI dependency: rejects
+                                 requests with a missing `If-Match` header
+                                 with `409`. Built here so T7's `DELETE`
+                                 path can attach the same dependency
+                                 without duplicating the header check.
 
 Tracers left by issue #2:
   * `GET  /todos`              — empty list; subscription list lands in #8.
@@ -44,6 +51,7 @@ from .domain import (
     InvalidStateTransitionError,
     InvalidTitleError,
     NotCreatorError,
+    StalePreconditionError,
     Todo,
     TodoService,
     TodoState,
@@ -90,6 +98,36 @@ class UpdateTodoBody(BaseModel):
     blocked_reason: str | None = None
 
 
+def require_if_match(
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> str:
+    """Reject requests with a missing `If-Match` header.
+
+    Reusable FastAPI dependency for routes that mutate a Todo (PATCH,
+    and the future DELETE in T7). Returns the header value so the route
+    can pass it on to the domain layer; raises `409 Conflict` when the
+    header is absent or empty.
+
+    Note: this dependency only enforces *presence*. The actual
+    optimistic-concurrency comparison against `updated_at` happens at
+    SQL level inside the service layer — that's what makes the check
+    atomic, so two racing writers can't both pass the HTTP-layer test.
+
+    Routes that attach this dependency should also attach their own
+    access gate *earlier in the function signature*, so callers who
+    shouldn't see the row receive the gate's `404` before `409` from
+    a missing `If-Match`. Otherwise a missing header would
+    accidentally confirm the row's existence to a caller who has no
+    read access.
+    """
+    if not if_match:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="If-Match header is required",
+        )
+    return if_match
+
+
 def create_app(db_factory: DBFactory | None = None) -> FastAPI:
     """Build a FastAPI app. Pass `db_factory` to inject a test connection."""
     @asynccontextmanager
@@ -117,6 +155,33 @@ def create_app(db_factory: DBFactory | None = None) -> FastAPI:
         # `TodoService` is stateless w.r.t. connections; the per-request `db`
         # flows through to the repository on each call.
         return TodoService(TodoRepository(), UserTodoViewRepository())
+
+    def enforce_subscription_gate(
+        todo_id: int,
+        user: AuthUser = Depends(verify_jwt),
+        db: sqlite3.Connection = Depends(get_db),
+        service: TodoService = Depends(get_service),
+    ) -> None:
+        """Reject requests for Todos the caller can't see.
+
+        PATCH-specific closure dependency (the future DELETE path in T7
+        uses a creator-only check, not a subscription check, so it
+        won't share this). Mirrors `GET /todos/{id}`'s read gate: a
+        `404` is raised for non-existent rows *and* for rows the caller
+        can't see (no subscription, not the creator). The two failures
+        collapse to the same envelope so the API doesn't leak
+        existence (ADR-0003).
+
+        Declared here as a closure (rather than at module scope) so it
+        can resolve `get_db` / `get_service` / `verify_jwt` from the
+        surrounding `create_app` body.
+        """
+        todo = service.get_for_user(db, todo_id=todo_id, user_id=user.sub)
+        if todo is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="todo not found",
+            )
 
     # --- routes -----------------------------------------------------------
 
@@ -172,30 +237,16 @@ def create_app(db_factory: DBFactory | None = None) -> FastAPI:
     def patch_todo(
         todo_id: int,
         body: UpdateTodoBody = Body(...),
-        if_match: str | None = Header(default=None),
+        # Subscription gate runs first: a non-subscriber (or non-creator)
+        # gets `404` before we ever look at `If-Match`. Otherwise a
+        # missing `If-Match` would accidentally confirm row existence
+        # to a caller who has no read access.
+        _: None = Depends(enforce_subscription_gate),
+        if_match: str = Depends(require_if_match),
         user: AuthUser = Depends(verify_jwt),
         db: sqlite3.Connection = Depends(get_db),
         service: TodoService = Depends(get_service),
     ) -> dict[str, object]:
-        # The subscription gate fires before any PATCH work. A user that
-        # can't see the todo gets the same 404 envelope `GET` returns —
-        # we don't surface "exists but you can't edit" as a different code.
-        existing = service.get_for_user(db, todo_id=todo_id, user_id=user.sub)
-        if existing is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="todo not found",
-            )
-
-        # `If-Match` is a precondition for every PATCH. In this ticket we
-        # only check that the header is present; comparing the value to
-        # `updated_at` lands in T3b / #6.
-        if not if_match:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="If-Match header is required",
-            )
-
         # Build the domain input from the explicitly-set fields only.
         # `exclude_unset=True` lets `body.blocked_reason = None` mean
         # "clear the field" while omitting the key entirely means
@@ -209,6 +260,7 @@ def create_app(db_factory: DBFactory | None = None) -> FastAPI:
                 db,
                 todo_id=todo_id,
                 actor_id=user.sub,
+                expected_updated_at=if_match,
                 input=input,
             )
         except InvalidTitleError:
@@ -220,6 +272,14 @@ def create_app(db_factory: DBFactory | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="illegal state transition",
+            ) from None
+        except StalePreconditionError:
+            # The atomic SQL UPDATE matched zero rows because the
+            # client's `If-Match` no longer matches the row. The client
+            # must re-read and retry; we don't merge or coerce.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="If-Match does not match the row's updated_at",
             ) from None
 
         return _serialize_todo(todo)
