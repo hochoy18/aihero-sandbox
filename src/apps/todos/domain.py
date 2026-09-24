@@ -7,6 +7,12 @@ Issue #3 acceptance criteria, expressed as domain rules:
   * A blank `title` is a domain-level validation error, surfaced as `422`
     by the HTTP layer.
 
+Issue #4 adds the subscription gate (`get_for_user`): a user can read a
+todo via `GET /todos/{id}` only if they are the creator, or they have a
+`user_todo_views` row. Either failure is surfaced as `404` by the HTTP
+layer — there is no distinction between "doesn't exist" and "exists but
+no access", to avoid leaking existence.
+
 The domain depends only on the persistence layer (no FastAPI, no HTTP
 status codes). The HTTP layer maps domain errors into status codes.
 """
@@ -17,7 +23,12 @@ import sqlite3
 from dataclasses import dataclass
 from enum import Enum
 
-from .repository import TODO_STATE_PENDING, TodoRepository, TodoRow
+from .repository import (
+    TODO_STATE_PENDING,
+    TodoRepository,
+    TodoRow,
+    UserTodoViewRepository,
+)
 
 
 class TodoState(str, Enum):
@@ -85,8 +96,13 @@ class TodoService:
     no connection state of its own.
     """
 
-    def __init__(self, repo: TodoRepository) -> None:
-        self._repo = repo
+    def __init__(
+        self,
+        todos: TodoRepository,
+        views: UserTodoViewRepository,
+    ) -> None:
+        self._todos = todos
+        self._views = views
 
     def create(
         self,
@@ -104,7 +120,7 @@ class TodoService:
         title = input.title.strip()
         if not title:
             raise InvalidTitleError("title must be a non-empty string")
-        row = self._repo.create(
+        row = self._todos.create(
             conn,
             title=title,
             description=input.description,
@@ -112,9 +128,34 @@ class TodoService:
         )
         return Todo.from_row(row)
 
-    def get(self, conn: sqlite3.Connection, todo_id: int) -> Todo | None:
-        row = self._repo.get_by_id(conn, todo_id)
-        return Todo.from_row(row) if row is not None else None
+    def get_for_user(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        todo_id: int,
+        user_id: str,
+    ) -> Todo | None:
+        """Fetch a todo for `user_id`, enforcing the subscription gate.
+
+        Returns the `Todo` when either:
+          * the todo doesn't exist → `None` (HTTP layer renders `404`), or
+          * the caller is the creator (creator bypass — no subscription row
+            required), or
+          * the caller has a `user_todo_views` row for this todo.
+
+        Returns `None` in every other situation. There is no separate "exists
+        but no access" signal — the two cases must collapse to the same
+        response so the API doesn't leak existence (ADR-0003).
+        """
+        row = self._todos.get_by_id(conn, todo_id)
+        todo = Todo.from_row(row) if row is not None else None
+        if todo is None:
+            return None
+        if todo.created_by == user_id:
+            return todo
+        if self._views.has_view(conn, user_id=user_id, todo_id=todo_id):
+            return todo
+        return None
 
 
 __all__ = [

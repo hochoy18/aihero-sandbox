@@ -8,12 +8,16 @@ Test path: `create_app(db_factory=...)` short-circuits the lifespan. The
 factory is called per request, so tests can share a single connection
 (`make_client(db)`) across the whole test.
 
-Routes owned by this ticket (issue #3):
+Routes owned by issue #3:
   * `POST /todos`              — create a todo as the authenticated caller.
-  * `GET  /todos/{id}`         — creator-only read; full subscription gate
-                                 lands in issue #4.
-  * `GET  /todos`              — tracer-bullet route; subscription list lands
-                                 in #8.
+
+Routes owned by issue #4:
+  * `GET  /todos/{id}`         — creator bypass + subscription gate; the
+                                 404 envelope is identical for non-existent
+                                 ids and non-subscribers (ADR-0003).
+
+Tracers left by issue #2:
+  * `GET  /todos`              — empty list; subscription list lands in #8.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ from pydantic import BaseModel
 from .auth import AuthUser, verify_jwt
 from .db import make_db
 from .domain import CreateTodoInput, InvalidTitleError, Todo, TodoService
-from .repository import TodoRepository
+from .repository import TodoRepository, UserTodoViewRepository
 
 DBFactory = Callable[[], sqlite3.Connection]
 
@@ -76,7 +80,7 @@ def create_app(db_factory: DBFactory | None = None) -> FastAPI:
     def get_service(db: sqlite3.Connection = Depends(get_db)) -> TodoService:
         # `TodoService` is stateless w.r.t. connections; the per-request `db`
         # flows through to the repository on each call.
-        return TodoService(TodoRepository())
+        return TodoService(TodoRepository(), UserTodoViewRepository())
 
     # --- routes -----------------------------------------------------------
 
@@ -116,10 +120,12 @@ def create_app(db_factory: DBFactory | None = None) -> FastAPI:
         db: sqlite3.Connection = Depends(get_db),
         service: TodoService = Depends(get_service),
     ) -> dict[str, object]:
-        # Creator bypass: the creator can always read their own todos. The
-        # subscription gate (`404` for non-subscribers) is issue #4.
-        todo = service.get(db, todo_id)
-        if todo is None or todo.created_by != user.sub:
+        # Subscription gate (ADR-0003): a user can read a todo only if they
+        # are the creator (bypass) or they have a `user_todo_views` row.
+        # "Doesn't exist" and "exists but no access" both collapse to 404
+        # with the same body — see issue #4 acceptance criteria.
+        todo = service.get_for_user(db, todo_id=todo_id, user_id=user.sub)
+        if todo is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="todo not found",

@@ -111,4 +111,32 @@ class TodoRepository:
         )
 
 
-__all__ = ["TodoRepository", "TodoRow"]
+class UserTodoViewRepository:
+    """SQLite-backed repository over the `user_todo_views` table.
+
+    Issue #4 introduces the subscription gate: `GET /todos/{id}` must check
+    that the caller has a row here (or is the todo's creator) before
+    returning the todo. The creator-bypass decision lives in `TodoService`,
+    not here — this repository answers only "does this user have a view of
+    this todo?"
+
+    Subscribe, unsubscribe, list-by-user, and reorder methods (issue #9)
+    will land here in a follow-up ticket.
+    """
+
+    def has_view(
+        self, conn: sqlite3.Connection, *, user_id: str, todo_id: int
+    ) -> bool:
+        """Return `True` iff `user_id` has a `user_todo_views` row for `todo_id`.
+
+        Existence is the only signal the service needs — `position` and
+        `subscribed_at` are not part of the read-gate check.
+        """
+        row = conn.execute(
+            "SELECT 1 FROM user_todo_views WHERE user_id = ? AND todo_id = ?",
+            (user_id, todo_id),
+        ).fetchone()
+        return row is not None
+
+
+__all__ = ["TodoRepository", "TodoRow", "UserTodoViewRepository"]
