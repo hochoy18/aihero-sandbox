@@ -13,6 +13,10 @@ todo via `GET /todos/{id}` only if they are the creator, or they have a
 layer — there is no distinction between "doesn't exist" and "exists but
 no access", to avoid leaking existence.
 
+Issue #5 adds `update()`: the state machine (ADR-0001) plus creator-only
+soft-delete. The HTTP layer is responsible for `If-Match`; the domain is
+responsible for transitions, creator-only rules, and title validation.
+
 The domain depends only on the persistence layer (no FastAPI, no HTTP
 status codes). The HTTP layer maps domain errors into status codes.
 """
@@ -22,12 +26,15 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Final
 
 from .repository import (
     TODO_STATE_PENDING,
+    UNSET,
     TodoRepository,
     TodoRow,
     UserTodoViewRepository,
+    utcnow_iso,
 )
 
 
@@ -39,8 +46,80 @@ class TodoState(str, Enum):
     DELETED = "deleted"
 
 
+# State machine (ADR-0001).
+#
+#   pending        -> in_progress, done, cancelled, deleted
+#   in_progress    -> pending, done, cancelled, deleted
+#   done           -> deleted       (terminal except for delete)
+#   cancelled      -> deleted       (terminal except for delete)
+#   deleted        -> {}            (no outgoing edges)
+#
+# Transitions to `deleted` are creator-only; every other legal transition
+# is open to any user with access (the subscription gate is the HTTP layer's
+# job, not the domain's).
+_LEGAL_TRANSITIONS: Final[dict[TodoState, frozenset[TodoState]]] = {
+    TodoState.PENDING: frozenset({
+        TodoState.IN_PROGRESS,
+        TodoState.DONE,
+        TodoState.CANCELLED,
+        TodoState.DELETED,
+    }),
+    TodoState.IN_PROGRESS: frozenset({
+        TodoState.PENDING,
+        TodoState.DONE,
+        TodoState.CANCELLED,
+        TodoState.DELETED,
+    }),
+    TodoState.DONE: frozenset({TodoState.DELETED}),
+    TodoState.CANCELLED: frozenset({TodoState.DELETED}),
+    TodoState.DELETED: frozenset(),
+}
+
+
+def is_legal_transition(from_state: TodoState, to_state: TodoState) -> bool:
+    """True iff the `from_state -> to_state` edge is in the state machine."""
+    return to_state in _LEGAL_TRANSITIONS[from_state]
+
+
+def is_creator_only_target(to_state: TodoState) -> bool:
+    """True iff reaching `to_state` requires the creator's identity.
+
+    Named for the target (not the source/target pair) because every state
+    can transition *to* `deleted`, so the gating question is solely
+    "does the actor have to be the creator to land here?"
+    """
+    return to_state is TodoState.DELETED
+
+
 class InvalidTitleError(ValueError):
     """Raised when a create/update body has no usable `title`."""
+
+
+class InvalidStateTransitionError(Exception):
+    """Raised when a requested state transition isn't in the state machine.
+
+    Carries the source and target states so the HTTP layer can shape a
+    useful 409 response without re-deriving them.
+    """
+
+    def __init__(self, from_state: TodoState, to_state: TodoState) -> None:
+        super().__init__(
+            f"cannot transition from {from_state.value} to {to_state.value}"
+        )
+        self.from_state = from_state
+        self.to_state = to_state
+
+
+class NotCreatorError(Exception):
+    """Raised when a non-creator attempts a creator-only operation (delete)."""
+
+
+# `UNSET` is the canonical sentinel for "field was not included in the
+# PATCH body" — re-exported from the persistence layer so the domain and
+# the repository share the same instance. The HTTP layer uses Pydantic's
+# `exclude_unset=True` to populate only the fields the client actually
+# sent; this sentinel keeps the boundary crisp — `None` carries domain
+# meaning (clear / set-to-null) and "unset" carries the no-op meaning.
 
 
 @dataclass(frozen=True)
@@ -86,6 +165,23 @@ class CreateTodoInput:
 
     title: str
     description: str
+
+
+@dataclass(frozen=True)
+class UpdateTodoInput:
+    """Validated update payload from the HTTP layer.
+
+    Each field's default is `UNSET`, meaning "field was not in the PATCH
+    body — leave the stored value alone." Setting a field to `None`
+    carries domain meaning (e.g. `blocked_reason=None` clears the
+    reason, `description=None` clears the description). `title=None` and
+    `state=None` are domain errors (raised by `TodoService.update`).
+    """
+
+    title: Any = UNSET
+    description: Any = UNSET
+    state: Any = UNSET
+    blocked_reason: Any = UNSET
 
 
 class TodoService:
@@ -157,11 +253,109 @@ class TodoService:
             return todo
         return None
 
+    def update(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        todo_id: int,
+        actor_id: str,
+        input: UpdateTodoInput,
+    ) -> Todo:
+        """Apply `input` to the row, enforcing the state machine and
+        creator-only rules.
+
+        Returns the persisted `Todo` after the update. Raises:
+          * `InvalidTitleError` — `title` is empty/whitespace.
+          * `InvalidStateTransitionError` — the requested state transition
+            is not in the state machine (ADR-0001).
+          * `NotCreatorError` — the caller is not the creator but is trying
+            to transition to `deleted`.
+
+        Subscription gating (404) is the HTTP layer's job; this method
+        trusts the caller has access. `If-Match` precondition checks are
+        also the HTTP layer's job (issue #5 accepts any value, T3b / #6
+        will compare to `updated_at`).
+        """
+        row = self._todos.get_by_id(conn, todo_id)
+        todo = Todo.from_row(row)
+
+        # Resolve the requested state (if any) and validate the transition
+        # before touching any field — fail closed. We compute the eventual
+        # `state` column write and the side-effect timestamps
+        # (`completed_at`, `deleted_at`) up front so the repository call
+        # below stays a single SQL statement.
+        new_state: TodoState | None = None
+        new_completed_at: Any = UNSET
+        new_deleted_at: Any = UNSET
+        if input.state is not UNSET:
+            if not isinstance(input.state, TodoState):
+                # The HTTP layer's Pydantic model should have caught this.
+                # Defending in depth keeps the domain rule independent of
+                # the transport.
+                raise ValueError("state must be a TodoState")
+            new_state = input.state
+            if new_state is not todo.state:
+                if not is_legal_transition(todo.state, new_state):
+                    raise InvalidStateTransitionError(todo.state, new_state)
+                if (
+                    is_creator_only_target(new_state)
+                    and todo.created_by != actor_id
+                ):
+                    raise NotCreatorError(
+                        "only the creator can transition a todo to deleted"
+                    )
+                # Side-effect timestamps: stamp `now()` when we *enter* a
+                # terminal state. We never overwrite an existing stamp on
+                # a subsequent, no-op write.
+                if new_state is TodoState.DONE:
+                    new_completed_at = utcnow_iso()
+                if new_state is TodoState.DELETED:
+                    new_deleted_at = utcnow_iso()
+
+        # Validate and resolve the new title (if any).
+        new_title: Any = UNSET
+        if input.title is not UNSET:
+            if input.title is None or not isinstance(input.title, str):
+                raise InvalidTitleError("title must be a non-empty string")
+            stripped = input.title.strip()
+            if not stripped:
+                raise InvalidTitleError("title must be a non-empty string")
+            new_title = stripped
+
+        # Description is freely writable. The repository stores it as an
+        # empty string when `None`; the API layer keeps the natural shape.
+        new_description: Any = UNSET
+        if input.description is not UNSET:
+            new_description = input.description
+
+        # `blocked_reason` accepts a string or `None` (which clears it).
+        new_blocked_reason: Any = UNSET
+        if input.blocked_reason is not UNSET:
+            new_blocked_reason = input.blocked_reason
+
+        updated = self._todos.update(
+            conn,
+            todo_id=todo_id,
+            title=new_title,
+            description=new_description,
+            state=new_state.value if new_state is not None else UNSET,
+            blocked_reason=new_blocked_reason,
+            completed_at=new_completed_at,
+            deleted_at=new_deleted_at,
+        )
+        return Todo.from_row(updated)
+
 
 __all__ = [
     "CreateTodoInput",
+    "InvalidStateTransitionError",
     "InvalidTitleError",
+    "NotCreatorError",
     "Todo",
     "TodoService",
     "TodoState",
+    "UNSET",
+    "UpdateTodoInput",
+    "is_creator_only_target",
+    "is_legal_transition",
 ]

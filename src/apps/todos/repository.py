@@ -9,6 +9,13 @@ The repository does not depend on the domain layer's `TodoState` enum: the DB
 stores `state` as a plain TEXT and the repository hands back a raw string.
 `TodoService` translates strings to enums in `Todo.from_row`. This keeps
 the dependency direction one-way (domain -> persistence, not the reverse).
+
+Issue #5 adds `update()`: a partial-update method that the service layer
+calls once it has resolved the state-machine and creator-only rules. The
+repository stamps `updated_at` itself; the service layer also sets
+`completed_at` / `deleted_at` via the same `update()` call when the new
+state implies those timestamps, so callers see exactly one write per
+PATCH.
 """
 
 from __future__ import annotations
@@ -16,21 +23,41 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any, Final
 
 # Constant lives here, not in the domain module, so the repository has no
 # inbound dependency on domain. The domain layer imports the same literal
 # as its canonical enum value.
-TODO_STATE_PENDING = "pending"
+TODO_STATE_PENDING: Final = "pending"
 
 
-def _utcnow_iso() -> str:
+def utcnow_iso() -> str:
     """Server-set timestamp in ISO 8601 with a trailing Z.
 
     Clients cannot override timestamps — this is the single source of `now()`.
     Microseconds are dropped to match the tracer-bullet fixture format and
     keep responses diff-friendly in tests.
+
+    Public so the domain layer can stamp `completed_at` and `deleted_at`
+    when transitioning to terminal states without going through SQL.
     """
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Sentinel mirroring the domain layer's `UNSET`. Lives here so the
+# repository doesn't import the domain module (the dependency arrow goes
+# domain -> persistence, not the reverse). The domain layer passes this
+# same sentinel through `UpdateTodoInput`; the repository treats anything
+# equal to `UNSET` as "no change for this column".
+class _UnsetType:
+    def __repr__(self) -> str:
+        return "<UNSET>"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+UNSET: Final[_UnsetType] = _UnsetType()
 
 
 @dataclass(frozen=True)
@@ -69,7 +96,7 @@ class TodoRepository:
         stamped server-side to the same instant so the row's edit history
         starts consistent.
         """
-        now = _utcnow_iso()
+        now = utcnow_iso()
         cursor = conn.execute(
             """
             INSERT INTO todos
@@ -82,6 +109,66 @@ class TodoRepository:
         return self._get_by_id(conn, cursor.lastrowid)
 
     def get_by_id(self, conn: sqlite3.Connection, todo_id: int) -> TodoRow | None:
+        return self._get_by_id(conn, todo_id)
+
+    def update(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        todo_id: int,
+        title: Any = UNSET,
+        description: Any = UNSET,
+        state: Any = UNSET,
+        blocked_reason: Any = UNSET,
+        completed_at: Any = UNSET,
+        deleted_at: Any = UNSET,
+    ) -> TodoRow:
+        """Apply a partial update and return the persisted row.
+
+        Columns whose argument is `UNSET` are not written; everything else
+        is. `updated_at` is always refreshed (the server is the single
+        source of `now()`). The caller — `TodoService.update` — resolves
+        the state-machine and creator-only rules before invoking this, so
+        by the time we get here the columns are guaranteed to be valid.
+
+        `completed_at` and `deleted_at` are stamped by the service layer
+        when the new state implies those timestamps, so they share this
+        single SQL statement and a single transaction.
+        """
+        assignments: list[str] = []
+        params: list[Any] = []
+
+        if title is not UNSET:
+            assignments.append("title = ?")
+            params.append(title)
+        if description is not UNSET:
+            # Storage uses `''` for "no description"; `None` becomes that.
+            assignments.append("description = ?")
+            params.append(description if description is not None else "")
+        if state is not UNSET:
+            assignments.append("state = ?")
+            params.append(state)
+        if blocked_reason is not UNSET:
+            assignments.append("blocked_reason = ?")
+            params.append(blocked_reason)
+        if completed_at is not UNSET:
+            assignments.append("completed_at = ?")
+            params.append(completed_at)
+        if deleted_at is not UNSET:
+            assignments.append("deleted_at = ?")
+            params.append(deleted_at)
+
+        # `updated_at` is always refreshed — the server is the sole writer.
+        now = utcnow_iso()
+        assignments.append("updated_at = ?")
+        params.append(now)
+
+        params.append(todo_id)
+        conn.execute(
+            f"UPDATE todos SET {', '.join(assignments)} WHERE id = ?",
+            params,
+        )
+        conn.commit()
         return self._get_by_id(conn, todo_id)
 
     def _get_by_id(self, conn: sqlite3.Connection, todo_id: int) -> TodoRow | None:
@@ -139,4 +226,9 @@ class UserTodoViewRepository:
         return row is not None
 
 
-__all__ = ["TodoRepository", "TodoRow", "UserTodoViewRepository"]
+__all__ = [
+    "TodoRepository",
+    "TodoRow",
+    "UserTodoViewRepository",
+    "UNSET",
+]

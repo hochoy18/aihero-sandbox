@@ -16,6 +16,13 @@ Routes owned by issue #4:
                                  404 envelope is identical for non-existent
                                  ids and non-subscribers (ADR-0003).
 
+Routes owned by issue #5:
+  * `PATCH /todos/{id}`        — state machine + creator-only delete,
+                                 freely-writable `blocked_reason`, and a
+                                 required `If-Match` header whose value is
+                                 accepted unchecked for now (T3b / #6 will
+                                 validate it against `updated_at`).
+
 Tracers left by issue #2:
   * `GET  /todos`              — empty list; subscription list lands in #8.
 """
@@ -26,13 +33,22 @@ import sqlite3
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
 from .auth import AuthUser, verify_jwt
 from .db import make_db
-from .domain import CreateTodoInput, InvalidTitleError, Todo, TodoService
+from .domain import (
+    CreateTodoInput,
+    InvalidStateTransitionError,
+    InvalidTitleError,
+    NotCreatorError,
+    Todo,
+    TodoService,
+    TodoState,
+    UpdateTodoInput,
+)
 from .repository import TodoRepository, UserTodoViewRepository
 
 DBFactory = Callable[[], sqlite3.Connection]
@@ -52,6 +68,26 @@ class CreateTodoBody(BaseModel):
 
     title: str
     description: str | None = None
+
+
+class UpdateTodoBody(BaseModel):
+    """`PATCH /todos/{id}` request body.
+
+    Every field is optional; an explicit `null` is distinct from a missing
+    key, so `model_dump(exclude_unset=True)` lets the route tell the
+    service which fields to touch. The service layer's `UNSET` sentinel
+    carries the "no change" meaning; a literal `None` carries the
+    "clear this field" meaning where the domain allows it (e.g.
+    `blocked_reason`).
+
+    `state` uses Pydantic's enum validation so a garbage string fails
+    here with a 422 instead of reaching the state machine.
+    """
+
+    title: str | None = None
+    description: str | None = None
+    state: TodoState | None = None
+    blocked_reason: str | None = None
 
 
 def create_app(db_factory: DBFactory | None = None) -> FastAPI:
@@ -130,6 +166,62 @@ def create_app(db_factory: DBFactory | None = None) -> FastAPI:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="todo not found",
             )
+        return _serialize_todo(todo)
+
+    @app.patch("/todos/{todo_id}")
+    def patch_todo(
+        todo_id: int,
+        body: UpdateTodoBody = Body(...),
+        if_match: str | None = Header(default=None),
+        user: AuthUser = Depends(verify_jwt),
+        db: sqlite3.Connection = Depends(get_db),
+        service: TodoService = Depends(get_service),
+    ) -> dict[str, object]:
+        # The subscription gate fires before any PATCH work. A user that
+        # can't see the todo gets the same 404 envelope `GET` returns —
+        # we don't surface "exists but you can't edit" as a different code.
+        existing = service.get_for_user(db, todo_id=todo_id, user_id=user.sub)
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="todo not found",
+            )
+
+        # `If-Match` is a precondition for every PATCH. In this ticket we
+        # only check that the header is present; comparing the value to
+        # `updated_at` lands in T3b / #6.
+        if not if_match:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="If-Match header is required",
+            )
+
+        # Build the domain input from the explicitly-set fields only.
+        # `exclude_unset=True` lets `body.blocked_reason = None` mean
+        # "clear the field" while omitting the key entirely means
+        # "leave the stored value alone". `UpdateTodoInput` and the body
+        # share the same four keys, so the spread maps 1:1; `UNSET` is
+        # the dataclass default for any field the client didn't send.
+        input = UpdateTodoInput(**body.model_dump(exclude_unset=True))
+
+        try:
+            todo = service.update(
+                db,
+                todo_id=todo_id,
+                actor_id=user.sub,
+                input=input,
+            )
+        except InvalidTitleError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="title must be a non-empty string",
+            ) from None
+        except (InvalidStateTransitionError, NotCreatorError):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="illegal state transition",
+            ) from None
+
         return _serialize_todo(todo)
 
     return app
