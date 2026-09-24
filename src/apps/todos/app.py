@@ -39,6 +39,14 @@ Routes owned by issue #7:
                                      and the default-active behaviour
                                      land in #8.
 
+Routes owned by issue #8:
+  * `GET    /todos`                — `?state=...` query parameter
+                                     accepts one or more comma-separated
+                                     `TodoState` values; absent the
+                                     parameter, the route filters to the
+                                     active set (`pending`, `in_progress`).
+                                     Invalid state names yield `422`.
+
 Tracers left by issue #2:
   * (none — the tracer list endpoint grew up into the real one in #7)
 """
@@ -49,7 +57,7 @@ import sqlite3
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
@@ -198,14 +206,16 @@ def create_app(db_factory: DBFactory | None = None) -> FastAPI:
 
     @app.get("/todos")
     def list_todos(
+        # Issue #8: comma-separated states. An absent or empty `?state`
+        # falls back to the active-only default — `Query` cannot tell
+        # those apart, so the helper normalizes both to `None`.
+        state: str | None = Query(default=None),
         user: AuthUser = Depends(verify_jwt),
         db: sqlite3.Connection = Depends(get_db),
         service: TodoService = Depends(get_service),
     ) -> dict[str, list[dict[str, object]]]:
-        # Issue #7: return the caller's subscribed todos in their own
-        # `position` order. State filtering and the active-only default
-        # land in #8; this returns everything they're subscribed to.
-        todos = service.list_for_user(db, user_id=user.sub)
+        states = _parse_state_filter(state)
+        todos = service.list_for_user(db, user_id=user.sub, states=states)
         return {"todos": [_serialize_todo(t) for t in todos]}
 
     @app.post("/todos", status_code=status.HTTP_201_CREATED)
@@ -377,3 +387,40 @@ def _serialize_todo(todo: Todo) -> dict[str, object]:
         "deleted_at": todo.deleted_at,
         "blocked_reason": todo.blocked_reason,
     }
+
+
+def _parse_state_filter(
+    raw: str | None,
+) -> frozenset[TodoState] | None:
+    """Translate the `?state=...` query value into a domain-level filter.
+
+    Returns `None` for the default-active behaviour (absent or empty
+    parameter); an explicit set of `TodoState`s otherwise. Whitespace
+    around each comma-separated token is trimmed so a caller passing
+    `?state=pending, done` is treated identically to `?state=pending,done`.
+
+    Unknown state names yield `422` with a body that names the offending
+    value. The whole query fails — we don't partially apply the recognised
+    names — because a partial filter would silently misrepresent what
+    the caller asked for.
+    """
+    if raw is None or not raw.strip():
+        return None
+    states: set[TodoState] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            # Treat `?state=pending,,done` as if the empty slot wasn't
+            # there; `?state=,` collapses to `None` above.
+            continue
+        try:
+            states.add(TodoState(token))
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"unknown state: {token}",
+            ) from None
+    if not states:
+        # All tokens were empty after stripping; treat as default-active.
+        return None
+    return frozenset(states)

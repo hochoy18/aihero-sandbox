@@ -17,25 +17,7 @@ from fastapi.testclient import TestClient
 
 from todos.auth import make_jwt
 
-from ._helpers import _auth, _create
-
-
-def _insert_subscription(
-    db: sqlite3.Connection, *, user_id: str, todo_id: int, position: int = 1
-) -> None:
-    """Insert a `user_todo_views` row directly.
-
-    `POST /todos/{id}/subscribe` lands in issue #9; until then we seed the
-    subscription table from the test to exercise the read-gate's positive
-    path.
-    """
-    db.execute(
-        "INSERT INTO user_todo_views "
-        "(user_id, todo_id, position, subscribed_at) "
-        "VALUES (?, ?, ?, ?)",
-        (user_id, todo_id, position, "2026-09-24T00:00:00Z"),
-    )
-    db.commit()
+from ._helpers import _auth, _create, _insert_subscription
 
 
 # --- happy path -------------------------------------------------------------

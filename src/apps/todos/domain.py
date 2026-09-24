@@ -87,6 +87,17 @@ _LEGAL_TRANSITIONS: Final[dict[TodoState, frozenset[TodoState]]] = {
 }
 
 
+# Default states surfaced by `GET /todos` (issue #8). The spec's "active-only"
+# default excludes the terminal states (`done`, `cancelled`) and the
+# soft-deleted state (`deleted`) — the list is "what should the user
+# action today?". `?state=...` overrides this set; absent an override, the
+# route passes `None` and the service substitutes `DEFAULT_ACTIVE_STATES`.
+DEFAULT_ACTIVE_STATES: Final[frozenset[TodoState]] = frozenset({
+    TodoState.PENDING,
+    TodoState.IN_PROGRESS,
+})
+
+
 def is_legal_transition(from_state: TodoState, to_state: TodoState) -> bool:
     """True iff the `from_state -> to_state` edge is in the state machine."""
     return to_state in _LEGAL_TRANSITIONS[from_state]
@@ -490,6 +501,7 @@ class TodoService:
         conn: sqlite3.Connection,
         *,
         user_id: str,
+        states: frozenset[TodoState] | None = None,
     ) -> list[Todo]:
         """Return the `Todo`s `user_id` is subscribed to, by position ASC.
 
@@ -499,22 +511,34 @@ class TodoService:
         person has chosen to track, and a single `IN (...)` fetch is
         an easy follow-up if profiles get large.
 
-        Filtering by `state` (the `?state=...` query param) lands in
-        #8; this method returns *all* subscribed rows in position
-        order, the default-active filter is layered on top later.
+        Filtering by `state` (issue #8): when `states` is `None`, the
+        default-active set (`pending`, `in_progress`) is used so the
+        route's "no `?state`" behaviour surfaces only what the user
+        should action today. Pass an explicit set to override.
+
+        Ordering comes from the views table's `position`, so the
+        filter never re-orders the result: we read ids in position
+        order, then drop ids whose `state` isn't in the requested set.
         """
+        effective_states = (
+            DEFAULT_ACTIVE_STATES if states is None else states
+        )
         todo_ids = self._views.list_todo_ids_for_user(conn, user_id=user_id)
         todos: list[Todo] = []
         for todo_id in todo_ids:
             row = self._todos.get_by_id(conn, todo_id)
-            if row is not None:
-                todos.append(Todo.from_row(row))
+            if row is None:
+                continue
+            if TodoState(row.state) not in effective_states:
+                continue
+            todos.append(Todo.from_row(row))
         return todos
 
 
 __all__ = [
     "AlreadySubscribedError",
     "CreateTodoInput",
+    "DEFAULT_ACTIVE_STATES",
     "InvalidStateTransitionError",
     "InvalidTitleError",
     "NotCreatorError",
